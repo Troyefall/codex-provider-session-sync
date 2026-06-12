@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Provider Session Sync"
+  short_description: "Keep Codex conversations visible across provider switches"
+  default_prompt: "Use $codex-provider-session-sync to install or repair provider session synchronization."
