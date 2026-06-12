@@ -13,6 +13,9 @@ and keeps them aligned in the background.
 
 Python 3.9 or newer is required.
 
+Run Codex at least once before installation so the current user's
+`config.toml`, session directories, and state database exist.
+
 ### macOS and Linux
 
 ```bash
@@ -34,6 +37,22 @@ The installer:
 4. Starts a user-level background watcher.
 
 Restart Codex once after the first installation so the Skill appears in Codex.
+
+Installing or copying only the Skill directory does not register a background
+service. Use the one-command installer above, or run the installed Skill's
+`install` command.
+
+## Per-user Scope
+
+The project contains no fixed username, home directory, database version, or
+conversation count. It resolves the current user's Codex data directory from
+`CODEX_HOME`, defaulting to that user's `~/.codex`.
+
+Each installation reads and modifies only the selected Codex home. User-level
+services are isolated by macOS login domain, Linux systemd user instance, and
+a user-specific Windows Scheduled Task name. Multiple operating-system users
+on the same computer can therefore install independent watchers for their own
+Codex data.
 
 ## Commands
 
@@ -57,8 +76,7 @@ On Windows, replace `python3` with `py -3` and use the equivalent path under
   `io.github.troyefall.codex-provider-session-sync`.
 - Linux: systemd user service
   `codex-provider-session-sync.service`.
-- Windows: current-user Scheduled Task
-  `Codex Provider Session Sync`.
+- Windows: current-user Scheduled Task with a stable user-specific suffix.
 
 The watcher responds to provider changes, database replacement or reindexing,
 new session files, and periodic reconciliation.

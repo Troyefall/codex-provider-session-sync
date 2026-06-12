@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,6 +160,28 @@ class ProviderSyncTests(unittest.TestCase):
         self.assertEqual(second.session_files_changed, 0)
         self.assertIsNone(second.backup_directory)
 
+    def test_sync_is_scoped_to_the_selected_codex_home(self):
+        first_root = self.root.parent / "user-one" / ".codex"
+        second_root = self.root.parent / "user-two" / ".codex"
+        first = CodexFixture(first_root, "provider-one", "OpenAI")
+        second = CodexFixture(second_root, "provider-two", "OpenAI")
+        second_session_before = second.active_session.read_bytes()
+
+        result = sync.sync_once(first_root)
+
+        self.assertEqual(result.provider, "provider-one")
+        self.assertEqual(second.active_session.read_bytes(), second_session_before)
+        connection = sqlite3.connect(str(second_root / "state_5.sqlite"))
+        try:
+            providers = {
+                row[0]
+                for row in connection.execute("SELECT model_provider FROM threads")
+            }
+        finally:
+            connection.close()
+        self.assertEqual(providers, {"OpenAI"})
+        self.assertIn(b'"model_provider":"provider-one"', first.active_session.read_bytes())
+
     def test_insert_trigger_assigns_current_provider(self):
         self.fixture()
         sync.sync_once(self.root)
@@ -280,9 +303,20 @@ class ServiceDefinitionTests(unittest.TestCase):
             Path("C:/Users/Test/provider_session_sync.py"),
         )
         self.assertIn("<RestartOnFailure>", xml)
-        self.assertEqual(
-            service_manager.WINDOWS_TASK, "Codex Provider Session Sync"
-        )
+        self.assertEqual(service_manager.WINDOWS_TASK, "Codex Provider Session Sync")
+
+    def test_windows_task_name_is_stable_and_user_specific(self):
+        with mock.patch.dict(
+            service_manager.os.environ, {"USERDOMAIN": "EXAMPLE"}, clear=False
+        ):
+            with mock.patch.object(service_manager.getpass, "getuser", return_value="alice"):
+                alice_first = service_manager.windows_task_name()
+                alice_second = service_manager.windows_task_name()
+            with mock.patch.object(service_manager.getpass, "getuser", return_value="bob"):
+                bob = service_manager.windows_task_name()
+        self.assertEqual(alice_first, alice_second)
+        self.assertNotEqual(alice_first, bob)
+        self.assertTrue(alice_first.startswith("Codex Provider Session Sync ("))
 
     def test_systemd_quoting(self):
         self.assertEqual(

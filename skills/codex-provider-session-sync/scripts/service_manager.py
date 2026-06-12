@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import os
 import plistlib
@@ -54,6 +55,17 @@ def _service_command(codex_home: Path, script_path: Path) -> List[str]:
         str(codex_home),
         "watch",
     ]
+
+
+def _windows_identity() -> str:
+    domain = os.environ.get("USERDOMAIN", ".")
+    return "{}\\{}".format(domain, getpass.getuser())
+
+
+def windows_task_name() -> str:
+    identity = _windows_identity().casefold().encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:12]
+    return "{} ({})".format(WINDOWS_TASK, suffix)
 
 
 def _write_json(path: Path, value: Dict[str, object]) -> None:
@@ -157,7 +169,7 @@ def _windows_task_xml(codex_home: Path, script_path: Path) -> str:
     arguments = escape(
         subprocess.list2cmdline(command[1:])
     )
-    user = escape("{}\\{}".format(os.environ.get("USERDOMAIN", "."), getpass.getuser()))
+    user = escape(_windows_identity())
     return """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Keep Codex sessions visible across provider switches.</Description></RegistrationInfo>
@@ -179,6 +191,7 @@ def _windows_task_xml(codex_home: Path, script_path: Path) -> str:
 
 def _install_windows(codex_home: Path, script_path: Path) -> Dict[str, object]:
     xml = _windows_task_xml(codex_home, script_path)
+    task_name = windows_task_name()
     descriptor, name = tempfile.mkstemp(suffix=".xml")
     os.close(descriptor)
     task_file = Path(name)
@@ -189,16 +202,20 @@ def _install_windows(codex_home: Path, script_path: Path) -> Dict[str, object]:
                 "schtasks.exe",
                 "/Create",
                 "/TN",
-                WINDOWS_TASK,
+                task_name,
                 "/XML",
                 str(task_file),
                 "/F",
             ]
         )
-        _run(["schtasks.exe", "/Run", "/TN", WINDOWS_TASK], check=False)
+        _run(["schtasks.exe", "/Run", "/TN", task_name], check=False)
+        _run(
+            ["schtasks.exe", "/Delete", "/TN", WINDOWS_TASK, "/F"],
+            check=False,
+        )
     finally:
         task_file.unlink(missing_ok=True)
-    return {"platform": "windows", "service": WINDOWS_TASK}
+    return {"platform": "windows", "service": task_name}
 
 
 def install_service(codex_home: Path, script_path: Path) -> Dict[str, object]:
@@ -247,8 +264,9 @@ def service_status(codex_home: Path) -> Dict[str, object]:
         )
         running = result.returncode == 0 and result.stdout.strip() == "active"
     elif os.name == "nt":
+        task_name = str(metadata.get("service") or windows_task_name())
         result = _run(
-            ["schtasks.exe", "/Query", "/TN", WINDOWS_TASK], check=False
+            ["schtasks.exe", "/Query", "/TN", task_name], check=False
         )
         installed = result.returncode == 0
         running = installed
@@ -285,11 +303,16 @@ def _uninstall_linux() -> Dict[str, object]:
 
 
 def _uninstall_windows() -> Dict[str, object]:
+    task_name = windows_task_name()
+    _run(
+        ["schtasks.exe", "/Delete", "/TN", task_name, "/F"],
+        check=False,
+    )
     _run(
         ["schtasks.exe", "/Delete", "/TN", WINDOWS_TASK, "/F"],
         check=False,
     )
-    return {"platform": "windows", "removed": WINDOWS_TASK}
+    return {"platform": "windows", "removed": task_name}
 
 
 def uninstall_service(

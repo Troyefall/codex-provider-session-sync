@@ -8,6 +8,10 @@ description: Install, repair, inspect, or remove automatic Codex provider-sessio
 Keep Codex thread database records and session metadata aligned with the active
 `model_provider` in `config.toml`.
 
+The implementation is per-user and contains no fixed home path or conversation
+count. Resolve the target from `CODEX_HOME`, defaulting to the current user's
+`~/.codex`, and never scan outside that directory.
+
 ## Workflow
 
 1. Locate `CODEX_HOME`, defaulting to `~/.codex`.
@@ -19,6 +23,10 @@ Keep Codex thread database records and session metadata aligned with the active
    backup path, and service status.
 6. Restart Codex after first installation so the newly installed Skill is
    discovered.
+
+Copying the Skill directory alone does not register a background service. Run
+the repository installer or this Skill's `install` command for automatic
+monitoring.
 
 Use `--codex-home PATH` before the command when Codex stores data elsewhere:
 
@@ -49,7 +57,7 @@ python3 scripts/provider_session_sync.py --codex-home /path/to/.codex status
 - `uninstall`: Remove the service while retaining conversations and backups.
 
 macOS uses a user LaunchAgent, Linux uses a systemd user service, and Windows
-uses a current-user Scheduled Task.
+uses a current-user Scheduled Task with a stable user-specific name.
 
 ## Failure Handling
 
