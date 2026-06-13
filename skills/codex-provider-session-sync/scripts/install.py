@@ -50,6 +50,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source = arguments.source_skill.expanduser().resolve()
     codex_home = arguments.codex_home.expanduser().resolve()
     destination = codex_home / "skills" / SKILL_NAME
+    sys.path.insert(0, str(source / "scripts"))
+    from service_manager import uninstall_service
+
+    uninstall_service(codex_home)
     copy_skill(source, destination)
 
     sys.path.insert(0, str(destination / "scripts"))
