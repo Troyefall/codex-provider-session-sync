@@ -21,7 +21,11 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 APP_NAME = "codex-provider-session-sync"
 STATE_TABLE = "provider_session_sync_state"
-INSERT_TRIGGER = "provider_session_sync_after_thread_insert"
+LEGACY_TRIGGERS = (
+    "provider_session_sync_after_thread_insert",
+    "sync_thread_provider_after_insert",
+    "sync_thread_provider_after_provider_update",
+)
 DEFAULT_POLL_SECONDS = 2.0
 DEFAULT_RECONCILE_SECONDS = 30.0
 LOCK_STALE_SECONDS = 300.0
@@ -57,20 +61,22 @@ class FilePatch:
 @dataclass
 class SyncResult:
     provider: str
+    provider_source: str
     database: str
     database_rows_changed: int
     session_files_changed: int
     backup_directory: Optional[str]
-    trigger_installed: bool
+    legacy_triggers_removed: int
 
     def as_dict(self) -> Dict[str, object]:
         return {
             "provider": self.provider,
+            "provider_source": self.provider_source,
             "database": self.database,
             "database_rows_changed": self.database_rows_changed,
             "session_files_changed": self.session_files_changed,
             "backup_directory": self.backup_directory,
-            "trigger_installed": self.trigger_installed,
+            "legacy_triggers_removed": self.legacy_triggers_removed,
         }
 
 
@@ -111,10 +117,10 @@ def _parse_toml_string(value: str) -> str:
     return value.split()[0]
 
 
-def read_configured_provider(codex_home: Path) -> str:
+def read_configured_provider(codex_home: Path) -> Optional[str]:
     config_path = codex_home / "config.toml"
     if not config_path.is_file():
-        raise SyncError("Codex configuration was not found: {}".format(config_path))
+        return None
 
     with config_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
@@ -126,7 +132,7 @@ def read_configured_provider(codex_home: Path) -> str:
                 if not provider:
                     raise SyncError("model_provider is empty in config.toml")
                 return provider
-    return "openai"
+    return None
 
 
 def _database_sort_key(path: Path) -> Tuple[int, int]:
@@ -160,14 +166,22 @@ def validate_database(connection: sqlite3.Connection, path: Path) -> None:
 
 
 def discover_state_database(codex_home: Path) -> Path:
-    candidates = sorted(
-        codex_home.glob("state_*.sqlite"), key=_database_sort_key, reverse=True
-    )
-    if not candidates:
-        raise CompatibilityError(
-            "No Codex state_*.sqlite database was found in {}".format(codex_home)
+    path = None
+    searched = []
+    for root in (codex_home / "sqlite", codex_home):
+        searched.append(str(root))
+        candidates = sorted(
+            root.glob("state_*.sqlite"), key=_database_sort_key, reverse=True
         )
-    path = candidates[0]
+        if candidates:
+            path = candidates[0]
+            break
+    if path is None:
+        raise CompatibilityError(
+            "No Codex state_*.sqlite database was found in {}".format(
+                " or ".join(searched)
+            )
+        )
     try:
         connection = sqlite3.connect(
             "file:{}?mode=ro".format(path.as_posix()), uri=True
@@ -269,26 +283,170 @@ def prepare_session_patches(codex_home: Path, provider: str) -> List[FilePatch]:
     ]
 
 
-def _trigger_exists(connection: sqlite3.Connection) -> bool:
-    row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-        (INSERT_TRIGGER,),
-    ).fetchone()
-    return row is not None
+def _legacy_triggers(connection: sqlite3.Connection) -> List[str]:
+    placeholders = ",".join("?" for _ in LEGACY_TRIGGERS)
+    return [
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'trigger' AND name IN ({})".format(placeholders),
+            LEGACY_TRIGGERS,
+        )
+    ]
+
+
+def _state_table_exists(connection: sqlite3.Connection) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (STATE_TABLE,),
+        ).fetchone()
+        is not None
+    )
 
 
 def inspect_database(
     database_path: Path, provider: str, timeout: float
-) -> Tuple[int, bool]:
+) -> Tuple[int, List[str], bool]:
     connection = sqlite3.connect(str(database_path), timeout=timeout)
     try:
         validate_database(connection, database_path)
         rows = connection.execute(
             "SELECT COUNT(*) FROM threads WHERE model_provider <> ?", (provider,)
         ).fetchone()[0]
-        return int(rows), _trigger_exists(connection)
+        return int(rows), _legacy_triggers(connection), _state_table_exists(connection)
     finally:
         connection.close()
+
+
+def read_saved_provider(codex_home: Path) -> Optional[str]:
+    state_path = runtime_root(codex_home) / "state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    provider = state.get("provider")
+    return provider if isinstance(provider, str) and provider else None
+
+
+def _newest_database_provider(
+    database_path: Path,
+    different_from: Optional[str],
+    timeout: float,
+) -> Optional[str]:
+    connection = sqlite3.connect(str(database_path), timeout=timeout)
+    try:
+        validate_database(connection, database_path)
+        columns = set(_table_columns(connection, "threads"))
+        filters = []
+        parameters: List[object] = []
+        if "archived" in columns:
+            filters.append("archived = 0")
+        if "thread_source" in columns:
+            filters.append("thread_source = 'user'")
+        elif "has_user_event" in columns:
+            filters.append("has_user_event = 1")
+        if different_from is not None:
+            filters.append("model_provider <> ?")
+            parameters.append(different_from)
+
+        order_values = []
+        for name in ("updated_at_ms", "updated_at", "created_at_ms", "created_at"):
+            if name not in columns:
+                continue
+            multiplier = " * 1000" if not name.endswith("_ms") else ""
+            order_values.append("{}{}".format(name, multiplier))
+        order_values.append("rowid")
+        order_clause = "COALESCE({}) DESC".format(", ".join(order_values))
+
+        query = "SELECT model_provider FROM threads"
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += " ORDER BY {} LIMIT 1".format(order_clause)
+        row = connection.execute(query, parameters).fetchone()
+        if row is None and "thread_source" in columns:
+            relaxed_filters = [
+                item for item in filters if item != "thread_source = 'user'"
+            ]
+            query = "SELECT model_provider FROM threads"
+            if relaxed_filters:
+                query += " WHERE " + " AND ".join(relaxed_filters)
+            query += " ORDER BY {} LIMIT 1".format(order_clause)
+            row = connection.execute(query, parameters).fetchone()
+        if row and isinstance(row[0], str) and row[0]:
+            return row[0]
+        return None
+    finally:
+        connection.close()
+
+
+def read_session_provider(path: Path) -> str:
+    for line in path.read_bytes().splitlines():
+        if not SESSION_TYPE.search(line):
+            continue
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CompatibilityError(
+                "{} contains malformed session_meta JSON".format(path)
+            ) from exc
+        if record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        provider = payload.get("model_provider") if isinstance(payload, dict) else None
+        if not isinstance(provider, str) or not provider:
+            raise CompatibilityError(
+                "{} session_meta has no valid payload.model_provider".format(path)
+            )
+        return provider
+    raise CompatibilityError("{} has no session_meta record".format(path))
+
+
+def _newest_session_provider(
+    codex_home: Path, different_from: Optional[str]
+) -> Optional[str]:
+    candidates = sorted(
+        iter_session_files(codex_home),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for path in candidates:
+        provider = read_session_provider(path)
+        if different_from is None or provider != different_from:
+            return provider
+    return None
+
+
+def resolve_provider(
+    codex_home: Path, database_path: Path, timeout: float
+) -> Tuple[str, str]:
+    configured = read_configured_provider(codex_home)
+    if configured:
+        return configured, "config"
+
+    saved = read_saved_provider(codex_home)
+    if saved:
+        database_signal = _newest_database_provider(
+            database_path, different_from=saved, timeout=timeout
+        )
+        if database_signal:
+            return database_signal, "new-user-thread"
+        session_signal = _newest_session_provider(codex_home, different_from=saved)
+        if session_signal:
+            return session_signal, "new-session"
+        return saved, "saved-state"
+
+    database_provider = _newest_database_provider(
+        database_path, different_from=None, timeout=timeout
+    )
+    if database_provider:
+        return database_provider, "newest-user-thread"
+    session_provider = _newest_session_provider(codex_home, different_from=None)
+    if session_provider:
+        return session_provider, "newest-session"
+    raise SyncError("The active Codex provider could not be determined")
 
 
 def backup_database(source: Path, destination: Path, timeout: float) -> None:
@@ -310,7 +468,10 @@ def create_backup(
 ) -> Path:
     backup_dir = runtime_root(codex_home) / "backups" / utc_stamp()
     backup_dir.mkdir(parents=True, exist_ok=False)
-    backup_database(database_path, backup_dir / database_path.name, timeout)
+    database_relative = database_path.relative_to(codex_home)
+    database_backup = backup_dir / "database" / database_relative
+    database_backup.parent.mkdir(parents=True, exist_ok=True)
+    backup_database(database_path, database_backup, timeout)
 
     backed_up_files = []
     for patch in patches:
@@ -324,7 +485,7 @@ def create_backup(
     manifest = {
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "target_provider": provider,
-        "database": database_path.name,
+        "database": database_relative.as_posix(),
         "session_files": backed_up_files,
     }
     (backup_dir / "manifest.json").write_text(
@@ -343,7 +504,7 @@ def update_database(
     provider: str,
     timeout: float,
     retries: int,
-) -> int:
+) -> Tuple[int, int]:
     last_error = None
     for attempt in range(retries + 1):
         connection = sqlite3.connect(str(database_path), timeout=timeout)
@@ -356,50 +517,12 @@ def update_database(
                 (provider, provider),
             )
             changed = cursor.rowcount
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS provider_session_sync_state (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    provider TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                INSERT INTO provider_session_sync_state(singleton, provider, updated_at)
-                VALUES (1, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    provider = excluded.provider,
-                    updated_at = excluded.updated_at
-                """,
-                (provider, dt.datetime.now(dt.timezone.utc).isoformat()),
-            )
-            connection.execute(
-                "DROP TRIGGER IF EXISTS {}".format(INSERT_TRIGGER)
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER provider_session_sync_after_thread_insert
-                AFTER INSERT ON threads
-                WHEN NEW.model_provider <> (
-                    SELECT provider
-                    FROM provider_session_sync_state
-                    WHERE singleton = 1
-                )
-                BEGIN
-                    UPDATE threads
-                    SET model_provider = (
-                        SELECT provider
-                        FROM provider_session_sync_state
-                        WHERE singleton = 1
-                    )
-                    WHERE id = NEW.id;
-                END
-                """
-            )
+            legacy_triggers = _legacy_triggers(connection)
+            for trigger in legacy_triggers:
+                connection.execute('DROP TRIGGER IF EXISTS "{}"'.format(trigger))
+            connection.execute("DROP TABLE IF EXISTS {}".format(STATE_TABLE))
             connection.commit()
-            return int(changed)
+            return int(changed), len(legacy_triggers)
         except sqlite3.OperationalError as exc:
             connection.rollback()
             last_error = exc
@@ -499,13 +622,17 @@ def sync_once(
 ) -> SyncResult:
     codex_home = codex_home.expanduser().resolve()
     with SyncLock(codex_home):
-        provider = read_configured_provider(codex_home)
         database_path = discover_state_database(codex_home)
-        database_rows, trigger_present = inspect_database(
+        provider, provider_source = resolve_provider(
+            codex_home, database_path, timeout
+        )
+        database_rows, legacy_triggers, state_table_present = inspect_database(
             database_path, provider, timeout
         )
         patches = prepare_session_patches(codex_home, provider)
-        needs_database_write = database_rows > 0 or not trigger_present
+        needs_database_write = (
+            database_rows > 0 or bool(legacy_triggers) or state_table_present
+        )
         backup_dir = None
         if needs_database_write or patches:
             backup_dir = create_backup(
@@ -514,19 +641,20 @@ def sync_once(
 
         for patch in patches:
             apply_session_patch(patch)
-        changed_rows = (
+        changed_rows, removed_triggers = (
             update_database(database_path, provider, timeout, retries)
             if needs_database_write
-            else 0
+            else (0, 0)
         )
 
         result = SyncResult(
             provider=provider,
+            provider_source=provider_source,
             database=str(database_path),
             database_rows_changed=changed_rows,
             session_files_changed=len(patches),
             backup_directory=str(backup_dir) if backup_dir else None,
-            trigger_installed=True,
+            legacy_triggers_removed=removed_triggers,
         )
         state_path = runtime_root(codex_home) / "state.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,17 +676,18 @@ def sync_once(
 def storage_fingerprint(codex_home: Path) -> Tuple[object, ...]:
     config = codex_home / "config.toml"
     database = discover_state_database(codex_home)
-    config_stat = config.stat()
+    config_stat = config.stat() if config.exists() else None
     database_stat = database.stat()
     session_counts = []
     for name in ("sessions", "archived_sessions"):
         root = codex_home / name
-        count = sum(1 for _ in root.rglob("*.jsonl")) if root.is_dir() else 0
-        session_counts.append(count)
+        files = list(root.rglob("*.jsonl")) if root.is_dir() else []
+        newest = max((path.stat().st_mtime_ns for path in files), default=0)
+        session_counts.extend((len(files), newest))
     return (
-        config_stat.st_mtime_ns,
-        config_stat.st_size,
-        database.name,
+        config_stat.st_mtime_ns if config_stat else 0,
+        config_stat.st_size if config_stat else 0,
+        str(database),
         database_stat.st_mtime_ns,
         database_stat.st_size,
         *session_counts,
@@ -604,14 +733,19 @@ def status(codex_home: Path) -> Dict[str, object]:
     result: Dict[str, object] = {
         "codex_home": str(codex_home),
         "configured_provider": None,
+        "resolved_provider": None,
+        "provider_source": None,
         "database": None,
         "providers": {},
-        "trigger_installed": False,
+        "legacy_triggers": [],
         "last_success": None,
         "service": {"installed": False, "running": False},
     }
-    result["configured_provider"] = read_configured_provider(codex_home)
     database = discover_state_database(codex_home)
+    result["configured_provider"] = read_configured_provider(codex_home)
+    resolved_provider, provider_source = resolve_provider(codex_home, database, 5.0)
+    result["resolved_provider"] = resolved_provider
+    result["provider_source"] = provider_source
     result["database"] = str(database)
     connection = sqlite3.connect(str(database))
     try:
@@ -622,7 +756,7 @@ def status(codex_home: Path) -> Dict[str, object]:
                 "SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider"
             )
         }
-        result["trigger_installed"] = _trigger_exists(connection)
+        result["legacy_triggers"] = _legacy_triggers(connection)
     finally:
         connection.close()
     state_path = runtime_root(codex_home) / "state.json"
