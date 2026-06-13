@@ -5,16 +5,16 @@ model providers.
 
 Codex stores the provider name in both its SQLite thread index and each
 conversation's `session_meta` record. If those values no longer match the
-active `model_provider`, conversations can disappear from the sidebar even
-though their files still exist. This project synchronizes those metadata values
-and keeps them aligned in the background.
+active provider, conversations can disappear from the sidebar even though
+their files still exist. This project synchronizes those metadata values and
+keeps them aligned in the background.
 
 ## Install
 
 Python 3.9 or newer is required.
 
-Run Codex at least once before installation so the current user's
-`config.toml`, session directories, and state database exist.
+Run Codex at least once before installation so the current user's session
+directories and state database exist.
 
 ### macOS and Linux
 
@@ -79,7 +79,14 @@ On Windows, replace `python3` with `py -3` and use the equivalent path under
 - Windows: current-user Scheduled Task with a stable user-specific suffix.
 
 The watcher responds to provider changes, database replacement or reindexing,
-new session files, and periodic reconciliation.
+new session files, and periodic reconciliation. It supports both the current
+`$CODEX_HOME/sqlite/state_*.sqlite` location and the legacy
+`$CODEX_HOME/state_*.sqlite` location, preferring the current location.
+
+When `config.toml` contains a top-level `model_provider`, that value is
+authoritative. Newer Codex builds may omit it; in that case the watcher detects
+a switch from the newest user thread or session and retains the last successful
+provider between changes.
 
 ## Safety
 
@@ -101,6 +108,10 @@ The synchronizer uses parameterized SQLite statements, a process lock, SQLite
 busy retries, atomic JSONL replacement, and file-change detection. It stops
 without editing data if the Codex database schema or session metadata layout is
 not recognized.
+
+Versions before `1.0.2` installed a SQLite trigger. The current version removes
+that trigger and other known legacy provider-sync triggers because they can
+overwrite the first thread created after a provider switch.
 
 This project works with internal Codex storage. A future Codex release may
 change that format; compatibility failures are intentional and should be
