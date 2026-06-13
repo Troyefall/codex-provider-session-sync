@@ -6,7 +6,9 @@ description: Install, repair, inspect, or remove automatic Codex provider-sessio
 # Codex Provider Session Sync
 
 Keep Codex thread database records and session metadata aligned with the active
-`model_provider` in `config.toml`.
+provider. Prefer a top-level `model_provider` in `config.toml` when present;
+otherwise detect a switch from the newest user thread or session and retain the
+last successful provider.
 
 The implementation is per-user and contains no fixed home path or conversation
 count. Resolve the target from `CODEX_HOME`, defaulting to the current user's
@@ -15,13 +17,15 @@ count. Resolve the target from `CODEX_HOME`, defaulting to the current user's
 ## Workflow
 
 1. Locate `CODEX_HOME`, defaulting to `~/.codex`.
-2. Run `python3 scripts/provider_session_sync.py status`.
-3. For a one-time repair, run `python3 scripts/provider_session_sync.py sync`.
-4. To install or repair automatic monitoring, run
+2. Prefer `$CODEX_HOME/sqlite/state_*.sqlite`, then support the legacy
+   `$CODEX_HOME/state_*.sqlite` location.
+3. Run `python3 scripts/provider_session_sync.py status`.
+4. For a one-time repair, run `python3 scripts/provider_session_sync.py sync`.
+5. To install or repair automatic monitoring, run
    `python3 scripts/provider_session_sync.py install`.
-5. Report the configured provider, changed database rows, changed session files,
-   backup path, and service status.
-6. Restart Codex after first installation so the newly installed Skill is
+6. Report the resolved provider and source, changed database rows, changed
+   session files, removed legacy triggers, backup path, and service status.
+7. Restart Codex after first installation so the newly installed Skill is
    discovered.
 
 Copying the Skill directory alone does not register a background service. Run
@@ -40,6 +44,8 @@ python3 scripts/provider_session_sync.py --codex-home /path/to/.codex status
   tool output.
 - Modify only `threads.model_provider` and
   `session_meta.payload.model_provider`.
+- Remove only provider-sync triggers and state tables created by older versions
+  of this project or its documented predecessor.
 - Preserve and report timestamped backups under
   `$CODEX_HOME/codex-provider-session-sync/backups`.
 - Stop on an unknown SQLite schema, malformed session metadata, or concurrent
