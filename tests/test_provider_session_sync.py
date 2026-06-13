@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 
@@ -19,6 +20,7 @@ import service_manager
 
 
 def create_database(path: Path, providers=("OpenAI", "openai")) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(path))
     try:
         connection.execute(
@@ -26,14 +28,30 @@ def create_database(path: Path, providers=("OpenAI", "openai")) -> None:
             CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
                 model_provider TEXT NOT NULL,
-                title TEXT NOT NULL DEFAULT ''
+                title TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'vscode',
+                thread_source TEXT DEFAULT 'user',
+                has_user_event INTEGER NOT NULL DEFAULT 1,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
             )
             """
         )
         connection.executemany(
-            "INSERT INTO threads(id, model_provider, title) VALUES (?, ?, ?)",
+            """
+            INSERT INTO threads(
+                id, model_provider, title, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
             [
-                ("thread-{}".format(index), provider, "Title {}".format(index))
+                (
+                    "thread-{}".format(index),
+                    provider,
+                    "Title {}".format(index),
+                    index + 1,
+                    index + 1,
+                )
                 for index, provider in enumerate(providers)
             ],
         )
@@ -68,16 +86,27 @@ def session_bytes(provider: str, message: str = "Keep this message unchanged.") 
 
 
 class CodexFixture:
-    def __init__(self, root: Path, configured: str, stored: str):
+    def __init__(
+        self,
+        root: Path,
+        configured: Optional[str],
+        stored: str,
+        database_in_sqlite_directory: bool = False,
+    ):
         self.root = root
         self.root.mkdir(parents=True)
-        (self.root / "config.toml").write_text(
-            'model_provider = "{}"\n\n[model_providers.{}]\nname = "{}"\n'.format(
-                configured, configured, configured
-            ),
-            encoding="utf-8",
+        if configured is not None:
+            (self.root / "config.toml").write_text(
+                'model_provider = "{}"\n\n[model_providers.{}]\nname = "{}"\n'.format(
+                    configured, configured, configured
+                ),
+                encoding="utf-8",
+            )
+        database_root = (
+            self.root / "sqlite" if database_in_sqlite_directory else self.root
         )
-        create_database(self.root / "state_5.sqlite", (stored, stored))
+        self.database = database_root / "state_5.sqlite"
+        create_database(self.database, (stored, stored))
         active = self.root / "sessions" / "2026" / "06" / "12"
         active.mkdir(parents=True)
         self.active_session = active / "active.jsonl"
@@ -94,8 +123,18 @@ class ProviderSyncTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / ".codex"
 
-    def fixture(self, configured="custom", stored="OpenAI") -> CodexFixture:
-        return CodexFixture(self.root, configured, stored)
+    def fixture(
+        self,
+        configured="custom",
+        stored="OpenAI",
+        database_in_sqlite_directory=False,
+    ) -> CodexFixture:
+        return CodexFixture(
+            self.root,
+            configured,
+            stored,
+            database_in_sqlite_directory=database_in_sqlite_directory,
+        )
 
     def test_provider_migrations(self):
         cases = (
@@ -142,7 +181,7 @@ class ProviderSyncTests(unittest.TestCase):
         fixture = self.fixture()
         result = sync.sync_once(self.root)
         backup = Path(result.backup_directory)
-        self.assertTrue((backup / "state_5.sqlite").is_file())
+        self.assertTrue((backup / "database" / "state_5.sqlite").is_file())
         self.assertEqual(
             (backup / fixture.active_session.relative_to(self.root)).read_bytes(),
             session_bytes("OpenAI"),
@@ -182,42 +221,82 @@ class ProviderSyncTests(unittest.TestCase):
         self.assertEqual(providers, {"OpenAI"})
         self.assertIn(b'"model_provider":"provider-one"', first.active_session.read_bytes())
 
-    def test_insert_trigger_assigns_current_provider(self):
+    def test_new_user_thread_selects_provider_when_config_omits_it(self):
         self.fixture()
         sync.sync_once(self.root)
+        (self.root / "config.toml").write_text(
+            '[model_providers.custom]\nname = "custom"\n',
+            encoding="utf-8",
+        )
         connection = sqlite3.connect(str(self.root / "state_5.sqlite"))
         try:
             connection.execute(
-                "INSERT INTO threads(id, model_provider, title) VALUES (?, ?, ?)",
-                ("new-thread", "different", "New"),
+                """
+                INSERT INTO threads(
+                    id, model_provider, title, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                ("new-thread", "different", "New", 100, 100),
             )
             connection.commit()
-            provider = connection.execute(
-                "SELECT model_provider FROM threads WHERE id = 'new-thread'"
-            ).fetchone()[0]
         finally:
             connection.close()
-        self.assertEqual(provider, "custom")
+        result = sync.sync_once(self.root)
+        self.assertEqual(result.provider, "different")
+        self.assertEqual(result.provider_source, "new-user-thread")
+        self.assertEqual(result.database_rows_changed, 2)
 
-    def test_reinstalls_state_and_trigger_after_reindex(self):
+    def test_removes_legacy_triggers_after_reindex(self):
         self.fixture()
         sync.sync_once(self.root)
         database = self.root / "state_5.sqlite"
         connection = sqlite3.connect(str(database))
         try:
             connection.execute(
-                "DROP TRIGGER provider_session_sync_after_thread_insert"
+                """
+                CREATE TABLE provider_session_sync_state (
+                    singleton INTEGER PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
-            connection.execute("DROP TABLE provider_session_sync_state")
+            connection.execute(
+                """
+                CREATE TRIGGER provider_session_sync_after_thread_insert
+                AFTER INSERT ON threads BEGIN
+                    UPDATE threads SET model_provider = 'wrong' WHERE id = NEW.id;
+                END
+                """
+            )
             connection.execute("UPDATE threads SET model_provider = 'OpenAI'")
             connection.commit()
         finally:
             connection.close()
         result = sync.sync_once(self.root)
         self.assertEqual(result.database_rows_changed, 2)
+        self.assertEqual(result.legacy_triggers_removed, 1)
         state = sync.status(self.root)
-        self.assertTrue(state["trigger_installed"])
+        self.assertEqual(state["legacy_triggers"], [])
         self.assertEqual(state["providers"], {"custom": 2})
+
+    def test_sqlite_directory_is_preferred_over_legacy_root_database(self):
+        fixture = self.fixture(
+            configured="custom",
+            stored="OpenAI",
+            database_in_sqlite_directory=True,
+        )
+        create_database(self.root / "state_99.sqlite", ("legacy",))
+        result = sync.sync_once(self.root)
+        self.assertEqual(Path(result.database), fixture.database.resolve())
+        connection = sqlite3.connect(str(self.root / "state_99.sqlite"))
+        try:
+            provider = connection.execute(
+                "SELECT model_provider FROM threads"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(provider, "legacy")
 
     def test_malformed_session_meta_fails_before_database_change(self):
         fixture = self.fixture()
@@ -261,11 +340,11 @@ class ProviderSyncTests(unittest.TestCase):
         with self.assertRaises(sync.CompatibilityError):
             sync.discover_state_database(self.root)
 
-    def test_missing_configuration_fails(self):
-        self.root.mkdir()
-        create_database(self.root / "state_5.sqlite")
-        with self.assertRaises(sync.SyncError):
-            sync.sync_once(self.root)
+    def test_missing_configuration_infers_newest_user_thread(self):
+        CodexFixture(self.root, configured=None, stored="synthetic")
+        result = sync.sync_once(self.root)
+        self.assertEqual(result.provider, "synthetic")
+        self.assertEqual(result.provider_source, "newest-user-thread")
 
     def test_locked_database_reports_failure(self):
         self.fixture()
@@ -292,8 +371,10 @@ class ProviderSyncTests(unittest.TestCase):
         self.fixture()
         state = sync.status(self.root)
         self.assertEqual(state["configured_provider"], "custom")
+        self.assertEqual(state["resolved_provider"], "custom")
+        self.assertEqual(state["provider_source"], "config")
         self.assertEqual(state["providers"], {"OpenAI": 2})
-        self.assertFalse(state["trigger_installed"])
+        self.assertEqual(state["legacy_triggers"], [])
 
 
 class ServiceDefinitionTests(unittest.TestCase):
